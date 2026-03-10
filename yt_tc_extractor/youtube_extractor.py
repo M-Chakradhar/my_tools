@@ -29,37 +29,29 @@ def extract_video_id(url):
 
 
 def clean_vtt(vtt_text):
-    """Strip VTT formatting and return clean plain text."""
-    # Remove WEBVTT header
     lines = vtt_text.splitlines()
     text_lines = []
     for line in lines:
         line = line.strip()
-        # Skip headers, timestamps, blank lines, cue numbers
         if not line:
             continue
         if line.startswith("WEBVTT") or line.startswith("Kind:") or line.startswith("Language:"):
             continue
         if re.match(r"^\d{2}:\d{2}", line) or re.match(r"^\d+$", line):
             continue
-        # Remove HTML tags like <00:00:01.000><c> etc.
         line = re.sub(r"<[^>]+>", "", line)
         if line:
             text_lines.append(line)
-
-    # Deduplicate consecutive identical lines (common in auto-captions)
     deduped = []
     for line in text_lines:
         if not deduped or line != deduped[-1]:
             deduped.append(line)
-
     return " ".join(deduped)
 
 
 def get_transcript(video_id):
     try:
         import yt_dlp
-
         with tempfile.TemporaryDirectory() as tmpdir:
             ydl_opts = {
                 "skip_download": True,
@@ -71,33 +63,38 @@ def get_transcript(video_id):
                 "quiet": True,
                 "no_warnings": True,
             }
-
-            url = f"https://www.youtube.com/watch?v={video_id}"
-
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                ydl.download([url])
-
-            # Find the downloaded .vtt file
+                ydl.download([f"https://www.youtube.com/watch?v={video_id}"])
             vtt_file = None
             for fname in os.listdir(tmpdir):
                 if fname.endswith(".vtt"):
                     vtt_file = os.path.join(tmpdir, fname)
                     break
-
             if not vtt_file:
                 return None, "No captions/subtitles found for this video."
-
             with open(vtt_file, "r", encoding="utf-8") as f:
                 vtt_text = f.read()
-
             transcript = clean_vtt(vtt_text)
             if not transcript.strip():
                 return None, "Captions file was empty after processing."
-
             return transcript, None
-
     except Exception as e:
         return None, str(e)
+
+
+def get_total_comment_count(video_id, api_key):
+    """Fetch the total comment count shown on the video."""
+    try:
+        from googleapiclient.discovery import build
+        youtube = build("youtube", "v3", developerKey=api_key)
+        resp = youtube.videos().list(part="statistics", id=video_id).execute()
+        items = resp.get("items", [])
+        if not items:
+            return None
+        count = items[0]["statistics"].get("commentCount")
+        return int(count) if count else None
+    except Exception:
+        return None
 
 
 def get_comments(video_id, api_key, max_comments=500):
@@ -134,6 +131,14 @@ video_url = st.text_input(
     placeholder="https://www.youtube.com/watch?v=...",
 )
 
+# ── Show total comment count before extraction ────────────────────────────────
+if video_url.strip():
+    video_id_preview = extract_video_id(video_url.strip())
+    if video_id_preview and YOUTUBE_API_KEY:
+        total = get_total_comment_count(video_id_preview, YOUTUBE_API_KEY)
+        if total is not None:
+            st.info(f"💬 This video has **{total:,} total comments** on YouTube. Use this to decide how many to download below.")
+
 with st.expander("⚙️ Options"):
     fetch_transcript = st.checkbox("Extract Transcript", value=True)
     fetch_comments   = st.checkbox("Extract Comments",   value=True)
@@ -167,11 +172,20 @@ if run:
 
     st.info(f"Video ID: `{video_id}`")
 
+    # ── Transcript ────────────────────────────────────────────────────────────
     if fetch_transcript:
         with st.spinner("Fetching transcript... (this may take 20–30 seconds)"):
             transcript_text, err = get_transcript(video_id)
         if transcript_text:
-            st.success(f"✅ Transcript — {len(transcript_text.split()):,} words")
+            word_count = len(transcript_text.split())
+            char_count = len(transcript_text)
+
+            # Stats row
+            col1, col2 = st.columns(2)
+            col1.metric("📝 Word Count", f"{word_count:,}")
+            col2.metric("🔤 Characters", f"{char_count:,}")
+
+            st.success("✅ Transcript ready")
             with st.expander("📄 Preview"):
                 st.write(transcript_text[:3000] + ("…" if len(transcript_text) > 3000 else ""))
             st.download_button(
@@ -184,14 +198,26 @@ if run:
         else:
             st.warning(f"Could not fetch transcript: {err or 'Unknown error'}")
 
+    # ── Comments ──────────────────────────────────────────────────────────────
     if fetch_comments:
         if not active_api_key:
             st.warning("An API key is required to fetch comments.")
         else:
+            # Show total count again as a reminder near the download
+            total = get_total_comment_count(video_id, active_api_key)
+            if total is not None:
+                st.caption(f"ℹ️ Fetching {max_comments:,} of {total:,} total comments.")
+
             with st.spinner(f"Fetching up to {max_comments} comments..."):
                 comments, err = get_comments(video_id, active_api_key, max_comments)
+
             if comments is not None and len(comments) > 0:
-                st.success(f"✅ {len(comments):,} comments fetched")
+                col1, col2 = st.columns(2)
+                col1.metric("💬 Comments Fetched", f"{len(comments):,}")
+                if total:
+                    col2.metric("📊 Total on Video", f"{total:,}")
+
+                st.success("✅ Comments ready")
                 with st.expander("💬 Preview (first 20)"):
                     for i, c in enumerate(comments[:20], 1):
                         st.markdown(f"**{i}.** {c}")
