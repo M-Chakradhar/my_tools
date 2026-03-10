@@ -35,6 +35,25 @@ def extract_video_id(url):
 def get_transcript(video_id):
     try:
         from youtube_transcript_api import YouTubeTranscriptApi
+
+        # Try new instance-based API (v0.10+)
+        try:
+            api = YouTubeTranscriptApi()
+            entries = api.fetch(video_id)
+            text = " ".join(entry.get("text", "").strip() for entry in entries)
+            return text, None
+        except Exception:
+            pass
+
+        # Fallback: try get_transcript static method
+        try:
+            entries = YouTubeTranscriptApi.get_transcript(video_id)
+            text = " ".join(entry.get("text", "").strip() for entry in entries)
+            return text, None
+        except Exception:
+            pass
+
+        # Fallback: old list_transcripts API (v0.6.x)
         transcript_list = YouTubeTranscriptApi.list_transcripts(video_id)
         try:
             transcript = transcript_list.find_manually_created_transcript(["en"])
@@ -46,6 +65,7 @@ def get_transcript(video_id):
         entries = transcript.fetch()
         text = " ".join(entry["text"].strip() for entry in entries)
         return text, None
+
     except Exception as e:
         return None, str(e)
 
