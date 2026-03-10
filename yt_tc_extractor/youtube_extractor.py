@@ -83,7 +83,6 @@ def get_transcript(video_id):
 
 
 def get_total_comment_count(video_id, api_key):
-    """Fetch the total comment count shown on the video."""
     try:
         from googleapiclient.discovery import build
         youtube = build("youtube", "v3", developerKey=api_key)
@@ -97,26 +96,76 @@ def get_total_comment_count(video_id, api_key):
         return None
 
 
-def get_comments(video_id, api_key, max_comments=500):
+def get_comments(video_id, api_key, max_comments=500, progress_bar=None):
+    """Fetch top-level comments AND their replies, up to max_comments total."""
     try:
         from googleapiclient.discovery import build
         youtube = build("youtube", "v3", developerKey=api_key)
-        comments, next_page_token = [], None
-        while len(comments) < max_comments:
+
+        all_comments = []
+        next_page_token = None
+
+        while len(all_comments) < max_comments:
+            # Fetch a page of top-level comment threads
             resp = youtube.commentThreads().list(
-                part="snippet",
+                part="snippet,replies",
                 videoId=video_id,
-                maxResults=min(100, max_comments - len(comments)),
+                maxResults=min(100, max_comments - len(all_comments)),
                 pageToken=next_page_token,
                 textFormat="plainText",
             ).execute()
+
             for item in resp.get("items", []):
-                text = item["snippet"]["topLevelComment"]["snippet"]["textDisplay"]
-                comments.append(text.strip())
+                if len(all_comments) >= max_comments:
+                    break
+
+                # Add top-level comment
+                top = item["snippet"]["topLevelComment"]["snippet"]["textDisplay"].strip()
+                all_comments.append(top)
+
+                reply_count = item["snippet"].get("totalReplyCount", 0)
+                if reply_count == 0 or len(all_comments) >= max_comments:
+                    continue
+
+                # Replies already embedded in response (up to 5)
+                embedded_replies = item.get("replies", {}).get("comments", [])
+
+                if len(embedded_replies) >= reply_count:
+                    # All replies already included in the thread response
+                    for reply in embedded_replies:
+                        if len(all_comments) >= max_comments:
+                            break
+                        text = reply["snippet"]["textDisplay"].strip()
+                        all_comments.append(f"  ↳ {text}")
+                else:
+                    # More replies exist — fetch them via comments.list
+                    thread_id = item["id"]
+                    reply_page_token = None
+                    while len(all_comments) < max_comments:
+                        reply_resp = youtube.comments().list(
+                            part="snippet",
+                            parentId=thread_id,
+                            maxResults=min(100, max_comments - len(all_comments)),
+                            pageToken=reply_page_token,
+                            textFormat="plainText",
+                        ).execute()
+                        for r in reply_resp.get("items", []):
+                            if len(all_comments) >= max_comments:
+                                break
+                            text = r["snippet"]["textDisplay"].strip()
+                            all_comments.append(f"  ↳ {text}")
+                        reply_page_token = reply_resp.get("nextPageToken")
+                        if not reply_page_token:
+                            break
+
+                if progress_bar:
+                    progress_bar.progress(min(len(all_comments) / max_comments, 1.0))
+
             next_page_token = resp.get("nextPageToken")
             if not next_page_token:
                 break
-        return comments, None
+
+        return all_comments, None
     except Exception as e:
         return None, str(e)
 
@@ -131,13 +180,13 @@ video_url = st.text_input(
     placeholder="https://www.youtube.com/watch?v=...",
 )
 
-# ── Show total comment count before extraction ────────────────────────────────
+# Show total comment count as soon as URL is entered
 if video_url.strip():
     video_id_preview = extract_video_id(video_url.strip())
     if video_id_preview and YOUTUBE_API_KEY:
         total = get_total_comment_count(video_id_preview, YOUTUBE_API_KEY)
         if total is not None:
-            st.info(f"💬 This video has **{total:,} total comments** on YouTube. Use this to decide how many to download below.")
+            st.info(f"💬 This video has **{total:,} total comments** (including replies) on YouTube. Use this to decide how many to download below.")
 
 with st.expander("⚙️ Options"):
     fetch_transcript = st.checkbox("Extract Transcript", value=True)
@@ -179,12 +228,9 @@ if run:
         if transcript_text:
             word_count = len(transcript_text.split())
             char_count = len(transcript_text)
-
-            # Stats row
             col1, col2 = st.columns(2)
             col1.metric("📝 Word Count", f"{word_count:,}")
             col2.metric("🔤 Characters", f"{char_count:,}")
-
             st.success("✅ Transcript ready")
             with st.expander("📄 Preview"):
                 st.write(transcript_text[:3000] + ("…" if len(transcript_text) > 3000 else ""))
@@ -203,19 +249,24 @@ if run:
         if not active_api_key:
             st.warning("An API key is required to fetch comments.")
         else:
-            # Show total count again as a reminder near the download
             total = get_total_comment_count(video_id, active_api_key)
             if total is not None:
-                st.caption(f"ℹ️ Fetching {max_comments:,} of {total:,} total comments.")
+                st.caption(f"ℹ️ Fetching {max_comments:,} of {total:,} total comments (including replies).")
 
-            with st.spinner(f"Fetching up to {max_comments} comments..."):
-                comments, err = get_comments(video_id, active_api_key, max_comments)
+            progress_bar = st.progress(0, text="Fetching comments and replies...")
+            comments, err = get_comments(video_id, active_api_key, max_comments, progress_bar)
+            progress_bar.empty()
 
             if comments is not None and len(comments) > 0:
-                col1, col2 = st.columns(2)
-                col1.metric("💬 Comments Fetched", f"{len(comments):,}")
+                top_level = sum(1 for c in comments if not c.startswith("  ↳"))
+                replies    = sum(1 for c in comments if c.startswith("  ↳"))
+
+                col1, col2, col3 = st.columns(3)
+                col1.metric("💬 Total Fetched", f"{len(comments):,}")
+                col2.metric("🗨️ Top-level", f"{top_level:,}")
+                col3.metric("↳ Replies", f"{replies:,}")
                 if total:
-                    col2.metric("📊 Total on Video", f"{total:,}")
+                    st.caption(f"📊 Video has {total:,} total comments on YouTube.")
 
                 st.success("✅ Comments ready")
                 with st.expander("💬 Preview (first 20)"):
@@ -223,6 +274,7 @@ if run:
                         st.markdown(f"**{i}.** {c}")
                     if len(comments) > 20:
                         st.caption(f"…and {len(comments) - 20} more in the file.")
+
                 comments_text = "\n\n".join(f"[{i}] {c}" for i, c in enumerate(comments, 1))
                 st.download_button(
                     "⬇️ Download Comments (.txt)",
