@@ -1,6 +1,8 @@
 import streamlit as st
 import re
 import io
+import os
+import tempfile
 
 # ── Page config ───────────────────────────────────────────────────────────────
 st.set_page_config(
@@ -9,20 +11,14 @@ st.set_page_config(
     layout="centered",
 )
 
-# ── Load API key (Streamlit Secrets → env var → manual input fallback) ────────
+# ── Load API key ──────────────────────────────────────────────────────────────
 def load_api_key():
-    # 1. Streamlit Cloud secrets (recommended for deployment)
     try:
         return st.secrets["YOUTUBE_API_KEY"]
     except (KeyError, FileNotFoundError):
         pass
-    # 2. Environment variable (good for local / Docker)
-    import os
     key = os.environ.get("YOUTUBE_API_KEY", "")
-    if key:
-        return key
-    # 3. Nothing found — caller will show the manual input field
-    return None
+    return key if key else None
 
 YOUTUBE_API_KEY = load_api_key()
 
@@ -32,39 +28,73 @@ def extract_video_id(url):
     return m.group(1) if m else None
 
 
+def clean_vtt(vtt_text):
+    """Strip VTT formatting and return clean plain text."""
+    # Remove WEBVTT header
+    lines = vtt_text.splitlines()
+    text_lines = []
+    for line in lines:
+        line = line.strip()
+        # Skip headers, timestamps, blank lines, cue numbers
+        if not line:
+            continue
+        if line.startswith("WEBVTT") or line.startswith("Kind:") or line.startswith("Language:"):
+            continue
+        if re.match(r"^\d{2}:\d{2}", line) or re.match(r"^\d+$", line):
+            continue
+        # Remove HTML tags like <00:00:01.000><c> etc.
+        line = re.sub(r"<[^>]+>", "", line)
+        if line:
+            text_lines.append(line)
+
+    # Deduplicate consecutive identical lines (common in auto-captions)
+    deduped = []
+    for line in text_lines:
+        if not deduped or line != deduped[-1]:
+            deduped.append(line)
+
+    return " ".join(deduped)
+
+
 def get_transcript(video_id):
     try:
-        from youtube_transcript_api import YouTubeTranscriptApi
+        import yt_dlp
 
-        # Try new instance-based API (v0.10+)
-        try:
-            api = YouTubeTranscriptApi()
-            entries = api.fetch(video_id)
-            text = " ".join(entry.get("text", "").strip() for entry in entries)
-            return text, None
-        except Exception:
-            pass
+        with tempfile.TemporaryDirectory() as tmpdir:
+            ydl_opts = {
+                "skip_download": True,
+                "writeautomaticsub": True,
+                "writesubtitles": True,
+                "subtitleslangs": ["en", "en-US", "en-GB"],
+                "subtitlesformat": "vtt",
+                "outtmpl": os.path.join(tmpdir, "%(id)s.%(ext)s"),
+                "quiet": True,
+                "no_warnings": True,
+            }
 
-        # Fallback: try get_transcript static method
-        try:
-            entries = YouTubeTranscriptApi.get_transcript(video_id)
-            text = " ".join(entry.get("text", "").strip() for entry in entries)
-            return text, None
-        except Exception:
-            pass
+            url = f"https://www.youtube.com/watch?v={video_id}"
 
-        # Fallback: old list_transcripts API (v0.6.x)
-        transcript_list = YouTubeTranscriptApi.list_transcripts(video_id)
-        try:
-            transcript = transcript_list.find_manually_created_transcript(["en"])
-        except Exception:
-            try:
-                transcript = transcript_list.find_generated_transcript(["en"])
-            except Exception:
-                transcript = next(iter(transcript_list))
-        entries = transcript.fetch()
-        text = " ".join(entry["text"].strip() for entry in entries)
-        return text, None
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                ydl.download([url])
+
+            # Find the downloaded .vtt file
+            vtt_file = None
+            for fname in os.listdir(tmpdir):
+                if fname.endswith(".vtt"):
+                    vtt_file = os.path.join(tmpdir, fname)
+                    break
+
+            if not vtt_file:
+                return None, "No captions/subtitles found for this video."
+
+            with open(vtt_file, "r", encoding="utf-8") as f:
+                vtt_text = f.read()
+
+            transcript = clean_vtt(vtt_text)
+            if not transcript.strip():
+                return None, "Captions file was empty after processing."
+
+            return transcript, None
 
     except Exception as e:
         return None, str(e)
@@ -109,9 +139,8 @@ with st.expander("⚙️ Options"):
     fetch_comments   = st.checkbox("Extract Comments",   value=True)
     max_comments     = st.slider("Max comments to fetch", 50, 1000, 200, step=50)
 
-    # Only show the API key input if NOT already loaded from secrets/env
     if YOUTUBE_API_KEY:
-        st.success("✅ YouTube API key loaded from server config — not required from you.")
+        st.success("✅ YouTube API key loaded from server config.")
         manual_api_key = None
     else:
         st.warning("No server-side API key configured.")
@@ -119,10 +148,8 @@ with st.expander("⚙️ Options"):
             "Enter your YouTube Data API Key (for comments only)",
             type="password",
             placeholder="AIza...",
-            help="Get a free key at https://console.cloud.google.com — enable YouTube Data API v3.",
         )
 
-# Resolve which key to use
 active_api_key = YOUTUBE_API_KEY or manual_api_key or ""
 
 run = st.button("🚀 Extract", use_container_width=True, type="primary")
@@ -140,12 +167,11 @@ if run:
 
     st.info(f"Video ID: `{video_id}`")
 
-    # Transcript
     if fetch_transcript:
-        with st.spinner("Fetching transcript..."):
+        with st.spinner("Fetching transcript... (this may take 20–30 seconds)"):
             transcript_text, err = get_transcript(video_id)
         if transcript_text:
-            st.success(f"Transcript — {len(transcript_text.split()):,} words")
+            st.success(f"✅ Transcript — {len(transcript_text.split()):,} words")
             with st.expander("📄 Preview"):
                 st.write(transcript_text[:3000] + ("…" if len(transcript_text) > 3000 else ""))
             st.download_button(
@@ -158,7 +184,6 @@ if run:
         else:
             st.warning(f"Could not fetch transcript: {err or 'Unknown error'}")
 
-    # Comments
     if fetch_comments:
         if not active_api_key:
             st.warning("An API key is required to fetch comments.")
@@ -166,7 +191,7 @@ if run:
             with st.spinner(f"Fetching up to {max_comments} comments..."):
                 comments, err = get_comments(video_id, active_api_key, max_comments)
             if comments is not None and len(comments) > 0:
-                st.success(f"{len(comments):,} comments fetched")
+                st.success(f"✅ {len(comments):,} comments fetched")
                 with st.expander("💬 Preview (first 20)"):
                     for i, c in enumerate(comments[:20], 1):
                         st.markdown(f"**{i}.** {c}")
@@ -186,4 +211,4 @@ if run:
                 st.error(f"Failed to fetch comments: {err}")
 
 st.divider()
-st.caption("Built with youtube-transcript-api & YouTube Data API v3. No data stored.")
+st.caption("Built with yt-dlp & YouTube Data API v3. No data stored.")
