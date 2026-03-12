@@ -11,6 +11,11 @@ st.set_page_config(
     layout="centered",
 )
 
+# ── Session state init ────────────────────────────────────────────────────────
+for key in ["transcript_text", "comments", "total_comments", "video_id"]:
+    if key not in st.session_state:
+        st.session_state[key] = None
+
 # ── Load API key ──────────────────────────────────────────────────────────────
 def load_api_key():
     try:
@@ -97,16 +102,13 @@ def get_total_comment_count(video_id, api_key):
 
 
 def get_comments(video_id, api_key, max_comments=500, progress_bar=None):
-    """Fetch top-level comments AND their replies, up to max_comments total."""
     try:
         from googleapiclient.discovery import build
         youtube = build("youtube", "v3", developerKey=api_key)
-
         all_comments = []
         next_page_token = None
 
         while len(all_comments) < max_comments:
-            # Fetch a page of top-level comment threads
             resp = youtube.commentThreads().list(
                 part="snippet,replies",
                 videoId=video_id,
@@ -118,8 +120,6 @@ def get_comments(video_id, api_key, max_comments=500, progress_bar=None):
             for item in resp.get("items", []):
                 if len(all_comments) >= max_comments:
                     break
-
-                # Add top-level comment
                 top = item["snippet"]["topLevelComment"]["snippet"]["textDisplay"].strip()
                 all_comments.append(top)
 
@@ -127,18 +127,13 @@ def get_comments(video_id, api_key, max_comments=500, progress_bar=None):
                 if reply_count == 0 or len(all_comments) >= max_comments:
                     continue
 
-                # Replies already embedded in response (up to 5)
                 embedded_replies = item.get("replies", {}).get("comments", [])
-
                 if len(embedded_replies) >= reply_count:
-                    # All replies already included in the thread response
                     for reply in embedded_replies:
                         if len(all_comments) >= max_comments:
                             break
-                        text = reply["snippet"]["textDisplay"].strip()
-                        all_comments.append(f"  ↳ {text}")
+                        all_comments.append(f"  ↳ {reply['snippet']['textDisplay'].strip()}")
                 else:
-                    # More replies exist — fetch them via comments.list
                     thread_id = item["id"]
                     reply_page_token = None
                     while len(all_comments) < max_comments:
@@ -152,8 +147,7 @@ def get_comments(video_id, api_key, max_comments=500, progress_bar=None):
                         for r in reply_resp.get("items", []):
                             if len(all_comments) >= max_comments:
                                 break
-                            text = r["snippet"]["textDisplay"].strip()
-                            all_comments.append(f"  ↳ {text}")
+                            all_comments.append(f"  ↳ {r['snippet']['textDisplay'].strip()}")
                         reply_page_token = reply_resp.get("nextPageToken")
                         if not reply_page_token:
                             break
@@ -186,7 +180,7 @@ if video_url.strip():
     if video_id_preview and YOUTUBE_API_KEY:
         total = get_total_comment_count(video_id_preview, YOUTUBE_API_KEY)
         if total is not None:
-            st.info(f"💬 This video has **{total:,} total comments** (including replies) on YouTube. Use this to decide how many to download below.")
+            st.info(f"💬 This video has **{total:,} total comments** (including replies) on YouTube.")
 
 with st.expander("⚙️ Options"):
     fetch_transcript = st.checkbox("Extract Transcript", value=True)
@@ -206,9 +200,17 @@ with st.expander("⚙️ Options"):
 
 active_api_key = YOUTUBE_API_KEY or manual_api_key or ""
 
+# ── Custom file name input ────────────────────────────────────────────────────
+st.divider()
+custom_name = st.text_input(
+    "📁 File name prefix (optional)",
+    placeholder="e.g. fireship_rust_video",
+    help="Files will be saved as {name}_transcript.txt and {name}_comments.txt. Leave blank to use the video ID.",
+)
+
 run = st.button("🚀 Extract", use_container_width=True, type="primary")
 
-# ── Processing ────────────────────────────────────────────────────────────────
+# ── Extraction — only runs when Extract is clicked ────────────────────────────
 if run:
     if not video_url.strip():
         st.error("Please enter a YouTube URL.")
@@ -216,77 +218,92 @@ if run:
 
     video_id = extract_video_id(video_url.strip())
     if not video_id:
-        st.error("Could not parse a video ID from that URL. Please check the link.")
+        st.error("Could not parse a video ID from that URL.")
         st.stop()
+
+    # Clear previous results
+    st.session_state.transcript_text = None
+    st.session_state.comments = None
+    st.session_state.total_comments = None
+    st.session_state.video_id = video_id
 
     st.info(f"Video ID: `{video_id}`")
 
-    # ── Transcript ────────────────────────────────────────────────────────────
     if fetch_transcript:
         with st.spinner("Fetching transcript... (this may take 20–30 seconds)"):
             transcript_text, err = get_transcript(video_id)
         if transcript_text:
-            word_count = len(transcript_text.split())
-            char_count = len(transcript_text)
-            col1, col2 = st.columns(2)
-            col1.metric("📝 Word Count", f"{word_count:,}")
-            col2.metric("🔤 Characters", f"{char_count:,}")
-            st.success("✅ Transcript ready")
-            with st.expander("📄 Preview"):
-                st.write(transcript_text[:3000] + ("…" if len(transcript_text) > 3000 else ""))
-            st.download_button(
-                "⬇️ Download Transcript (.txt)",
-                data=io.BytesIO(transcript_text.encode()),
-                file_name=f"transcript_{video_id}.txt",
-                mime="text/plain",
-                use_container_width=True,
-            )
+            st.session_state.transcript_text = transcript_text
         else:
             st.warning(f"Could not fetch transcript: {err or 'Unknown error'}")
 
-    # ── Comments ──────────────────────────────────────────────────────────────
     if fetch_comments:
         if not active_api_key:
             st.warning("An API key is required to fetch comments.")
         else:
             total = get_total_comment_count(video_id, active_api_key)
-            if total is not None:
+            st.session_state.total_comments = total
+            if total:
                 st.caption(f"ℹ️ Fetching {max_comments:,} of {total:,} total comments (including replies).")
-
             progress_bar = st.progress(0, text="Fetching comments and replies...")
             comments, err = get_comments(video_id, active_api_key, max_comments, progress_bar)
             progress_bar.empty()
-
-            if comments is not None and len(comments) > 0:
-                top_level = sum(1 for c in comments if not c.startswith("  ↳"))
-                replies    = sum(1 for c in comments if c.startswith("  ↳"))
-
-                col1, col2, col3 = st.columns(3)
-                col1.metric("💬 Total Fetched", f"{len(comments):,}")
-                col2.metric("🗨️ Top-level", f"{top_level:,}")
-                col3.metric("↳ Replies", f"{replies:,}")
-                if total:
-                    st.caption(f"📊 Video has {total:,} total comments on YouTube.")
-
-                st.success("✅ Comments ready")
-                with st.expander("💬 Preview (first 20)"):
-                    for i, c in enumerate(comments[:20], 1):
-                        st.markdown(f"**{i}.** {c}")
-                    if len(comments) > 20:
-                        st.caption(f"…and {len(comments) - 20} more in the file.")
-
-                comments_text = "\n\n".join(f"[{i}] {c}" for i, c in enumerate(comments, 1))
-                st.download_button(
-                    "⬇️ Download Comments (.txt)",
-                    data=io.BytesIO(comments_text.encode()),
-                    file_name=f"comments_{video_id}.txt",
-                    mime="text/plain",
-                    use_container_width=True,
-                )
-            elif comments is not None:
-                st.info("No comments found (comments may be disabled on this video).")
+            if comments is not None:
+                st.session_state.comments = comments
             else:
                 st.error(f"Failed to fetch comments: {err}")
+
+# ── Results — always shown if session_state has data ─────────────────────────
+file_prefix = custom_name.strip() if custom_name.strip() else st.session_state.video_id
+
+if st.session_state.transcript_text:
+    st.divider()
+    transcript_text = st.session_state.transcript_text
+    word_count = len(transcript_text.split())
+    char_count = len(transcript_text)
+    col1, col2 = st.columns(2)
+    col1.metric("📝 Word Count", f"{word_count:,}")
+    col2.metric("🔤 Characters", f"{char_count:,}")
+    st.success("✅ Transcript ready")
+    with st.expander("📄 Preview Transcript"):
+        st.write(transcript_text[:3000] + ("…" if len(transcript_text) > 3000 else ""))
+    st.download_button(
+        "⬇️ Download Transcript (.txt)",
+        data=io.BytesIO(transcript_text.encode()),
+        file_name=f"{file_prefix}_transcript.txt",
+        mime="text/plain",
+        use_container_width=True,
+    )
+
+if st.session_state.comments:
+    st.divider()
+    comments = st.session_state.comments
+    total = st.session_state.total_comments
+    top_level = sum(1 for c in comments if not c.startswith("  ↳"))
+    replies    = sum(1 for c in comments if c.startswith("  ↳"))
+
+    col1, col2, col3 = st.columns(3)
+    col1.metric("💬 Total Fetched", f"{len(comments):,}")
+    col2.metric("🗨️ Top-level", f"{top_level:,}")
+    col3.metric("↳ Replies", f"{replies:,}")
+    if total:
+        st.caption(f"📊 Video has {total:,} total comments on YouTube.")
+
+    st.success("✅ Comments ready")
+    with st.expander("💬 Preview (first 20)"):
+        for i, c in enumerate(comments[:20], 1):
+            st.markdown(f"**{i}.** {c}")
+        if len(comments) > 20:
+            st.caption(f"…and {len(comments) - 20} more in the file.")
+
+    comments_text = "\n\n".join(f"[{i}] {c}" for i, c in enumerate(comments, 1))
+    st.download_button(
+        "⬇️ Download Comments (.txt)",
+        data=io.BytesIO(comments_text.encode()),
+        file_name=f"{file_prefix}_comments.txt",
+        mime="text/plain",
+        use_container_width=True,
+    )
 
 st.divider()
 st.caption("Built with yt-dlp & YouTube Data API v3. No data stored.")
