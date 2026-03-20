@@ -5,7 +5,18 @@ from datetime import datetime, timezone
 
 # ── Config ────────────────────────────────────────────────────────────────────
 
-HEADERS = {"User-Agent": "Mozilla/5.0 (RedditScriptScraper/1.0)"}
+HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/124.0.0.0 Safari/537.36"
+    ),
+    "Accept": "application/json, text/html,*/*;q=0.9",
+    "Accept-Language": "en-US,en;q=0.9",
+    "Accept-Encoding": "gzip, deflate, br",
+    "Referer": "https://www.reddit.com/",
+    "DNT": "1",
+}
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -21,7 +32,11 @@ def fmt_ts(unix: float) -> str:
     return datetime.fromtimestamp(unix, tz=timezone.utc).strftime("%Y-%m-%d")
 
 def fetch_reddit(url: str) -> list:
-    resp = requests.get(to_json_url(url), headers=HEADERS, timeout=12)
+    import time
+    session = requests.Session()
+    session.headers.update(HEADERS)
+    time.sleep(1.5)
+    resp = session.get(to_json_url(url), timeout=12)
     resp.raise_for_status()
     return resp.json()
 
